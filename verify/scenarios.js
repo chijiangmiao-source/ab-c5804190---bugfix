@@ -172,41 +172,74 @@ async function scenarioTailMissing() {
 }
 
 async function scenarioCrashAtomicity() {
-  const backend = newBackend();
-  const s = tab(backend, 'seed', {
-    timing: { lockTtlMs: 60, heartbeatMs: 20, stabilizeMs: 1, pollMs: 3 },
-  });
-  await s.start();
-  await s.submit(rec('pre', 1));
-  s.stop();
-  backend.map.delete(STORAGE_KEYS.K_LOCK);
+  const timing = { lockTtlMs: 60, heartbeatMs: 20, stabilizeMs: 1, pollMs: 3 };
+  // 一次提交的持久化边界（持锁写顺序）：
+  //   索引 pending -> 意图 -> 链 -> 锚点 -> 索引 committed -> 清意图
+  // 在任一边界关闭标签页并重开，只允许“完整记录”或“完全无记录”两种裁决。
+  const boundaries = [
+    { label: '索引 pending 后', key: STORAGE_KEYS.K_OPERATION_INDEX, occurrence: 1, committed: false },
+    { label: '意图写入后', key: STORAGE_KEYS.K_INTENTS, occurrence: 1, committed: false },
+    { label: '链写入后', key: STORAGE_KEYS.K_CHAIN, occurrence: 1, committed: true },
+    { label: '锚点推进后', key: STORAGE_KEYS.K_ANCHOR, occurrence: 1, committed: true },
+    { label: '索引 committed 后', key: STORAGE_KEYS.K_OPERATION_INDEX, occurrence: 2, committed: true },
+    { label: '意图清理后', key: STORAGE_KEYS.K_INTENTS, occurrence: 2, committed: true },
+  ];
+  for (const b of boundaries) {
+    const backend = newBackend();
+    const s = tab(backend, 'seed', { timing });
+    await s.start();
+    await s.submit(rec('pre', 1));
+    s.stop();
+    backend.map.delete(STORAGE_KEYS.K_LOCK);
 
-  const dying = tab(backend, 'dying', {
-    timing: { lockTtlMs: 60, heartbeatMs: 20, stabilizeMs: 1, pollMs: 3 },
-    onAfterWrite: ({ key }) => (key === STORAGE_KEYS.K_INTENTS ? 'die' : undefined),
-  });
-  await dying.start();
-  let died = null;
-  try {
-    await dying.submit(rec('inflight', 77));
-  } catch (e) {
-    died = e.code;
+    let writes = 0;
+    const dying = tab(backend, 'dying', {
+      timing,
+      onAfterWrite: ({ key }) => {
+        if (key !== b.key) return undefined;
+        writes += 1;
+        return writes === b.occurrence ? 'die' : undefined;
+      },
+    });
+    await dying.start();
+    let died = null;
+    try {
+      await dying.submit(rec('inflight', 77));
+    } catch (e) {
+      died = e.code;
+    }
+    check(`崩溃原子性（${b.label}）：关页被识别`, died === 'TAB_CLOSED', `got=${died}`);
+
+    const reopened = tab(backend, 'reopened', { timing });
+    await reopened.start();
+    const chainAfterReopen = read(backend, STORAGE_KEYS.K_CHAIN, []);
+    const indexAfterReopen = read(backend, STORAGE_KEYS.K_OPERATION_INDEX, {});
+    check(`崩溃原子性（${b.label}）：重开后${b.committed ? '记录完整' : '完全无记录'}`,
+      chainAfterReopen.length === (b.committed ? 2 : 1), `len=${chainAfterReopen.length}`);
+    check(`崩溃原子性（${b.label}）：不留孤儿意图与 pending 索引`,
+      read(backend, STORAGE_KEYS.K_INTENTS, []).length === 0
+      && (!indexAfterReopen.inflight || indexAfterReopen.inflight.phase === 'committed'));
+
+    const anchorBeforeRetry = backend.map.get(STORAGE_KEYS.K_ANCHOR);
+    const retry = await reopened.submit(rec('inflight', 77));
+    check(`崩溃原子性（${b.label}）：同内容重试${b.committed ? '幂等返回原记录' : '重新出块'}于 #2`,
+      retry.block.seq === 2 && retry.reused === b.committed,
+      `seq=${retry.block.seq} reused=${retry.reused}`);
+    if (b.committed) {
+      check(`崩溃原子性（${b.label}）：重试不推动可信链头`,
+        backend.map.get(STORAGE_KEYS.K_ANCHOR) === anchorBeforeRetry);
+    }
+    let conflict = null;
+    try {
+      await reopened.submit(rec('inflight', 78));
+    } catch (e) {
+      conflict = e.code;
+    }
+    check(`崩溃原子性（${b.label}）：异参复用稳定拒绝`, conflict === 'OPID_CONFLICT', `got=${conflict}`);
+    check(`崩溃原子性（${b.label}）：最终链独立复算通过`,
+      independentRecompute(read(backend, STORAGE_KEYS.K_CHAIN, [])).ok);
+    reopened.stop();
   }
-  check('崩溃原子性：意图后崩溃被识别', died === 'TAB_CLOSED', `got=${died}`);
-
-  const reopened = tab(backend, 'reopened', {
-    timing: { lockTtlMs: 60, heartbeatMs: 20, stabilizeMs: 1, pollMs: 3 },
-  });
-  await reopened.start();
-  check('崩溃原子性：重开后链上完全无该记录',
-    read(backend, STORAGE_KEYS.K_CHAIN, []).length === 1);
-  check('崩溃原子性：孤儿意图已清空',
-    backend.map.get(STORAGE_KEYS.K_INTENTS) === '[]');
-  const retry = await reopened.submit(rec('inflight', 77));
-  check('崩溃原子性：重试在 #2 重新出块', retry.block.seq === 2 && !retry.reused);
-  check('崩溃原子性：最终链独立复算通过',
-    independentRecompute(read(backend, STORAGE_KEYS.K_CHAIN, [])).ok);
-  reopened.stop();
 }
 
 export async function runScenarios() {
