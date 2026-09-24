@@ -209,11 +209,79 @@ async function scenarioCrashAtomicity() {
   reopened.stop();
 }
 
+// 同一业务操作在各提交持久化边界关闭标签页并重新打开：
+// 只允许“完整记录（同内容重试幂等返回原记录）”或“完全无记录（允许重新提交）”，
+// 异参复用稳定拒绝，链头锚点与连续序号不得退化。
+async function scenarioCrashBoundaries() {
+  const timing = { lockTtlMs: 60, heartbeatMs: 20, stabilizeMs: 1, pollMs: 3 };
+  const boundaries = [
+    { name: '索引pending', key: STORAGE_KEYS.K_OPERATION_INDEX, count: 1, committed: false },
+    { name: '意图写入', key: STORAGE_KEYS.K_INTENTS, count: 1, committed: false },
+    { name: '链追加', key: STORAGE_KEYS.K_CHAIN, count: 1, committed: true },
+    { name: '锚点推进', key: STORAGE_KEYS.K_ANCHOR, count: 1, committed: true },
+    { name: '索引committed', key: STORAGE_KEYS.K_OPERATION_INDEX, count: 2, committed: true },
+    { name: '意图清理', key: STORAGE_KEYS.K_INTENTS, count: 2, committed: true },
+  ];
+  for (const b of boundaries) {
+    const backend = newBackend();
+    const seed = tab(backend, `cb-seed-${b.name}`, { timing });
+    await seed.start();
+    await seed.submit(rec('cb-seed', 1));
+    seed.stop();
+    backend.map.delete(STORAGE_KEYS.K_LOCK);
+
+    const counts = new Map();
+    const dying = tab(backend, `cb-dying-${b.name}`, {
+      timing,
+      onAfterWrite: ({ key }) => {
+        const n = (counts.get(key) || 0) + 1;
+        counts.set(key, n);
+        return key === b.key && n === b.count ? 'die' : undefined;
+      },
+    });
+    await dying.start();
+    let died = null;
+    try {
+      await dying.submit(rec('cb-op', 77));
+    } catch (e) {
+      died = e.code;
+    }
+
+    const reopened = tab(backend, `cb-reopen-${b.name}`, { timing });
+    await reopened.start();
+    const chainAfterReopen = read(backend, STORAGE_KEYS.K_CHAIN, []);
+    check(`崩溃边界[${b.name}]：关闭被识别，重开后判定为${b.committed ? '完整记录' : '完全无记录'}`,
+      died === 'TAB_CLOSED' && chainAfterReopen.length === (b.committed ? 2 : 1),
+      `died=${died} len=${chainAfterReopen.length}`);
+
+    const retry = await reopened.submit(rec('cb-op', 77));
+    check(`崩溃边界[${b.name}]：同内容重试${b.committed ? '幂等返回原记录' : '允许重新提交'}`,
+      retry.block.seq === 2 && retry.reused === b.committed,
+      `seq=${retry.block.seq} reused=${retry.reused}`);
+
+    const finalChain = read(backend, STORAGE_KEYS.K_CHAIN, []);
+    const anchor = read(backend, STORAGE_KEYS.K_ANCHOR, null);
+    check(`崩溃边界[${b.name}]：链头锚点一致且独立复算通过`,
+      finalChain.length === 2 && anchor && anchor.seq === 2
+      && anchor.digest === finalChain[1].digest && independentRecompute(finalChain).ok);
+
+    let conflict = null;
+    try {
+      await reopened.submit(rec('cb-op', 78));
+    } catch (e) {
+      conflict = e.code;
+    }
+    check(`崩溃边界[${b.name}]：异参复用稳定拒绝`, conflict === 'OPID_CONFLICT', `got=${conflict}`);
+    reopened.stop();
+  }
+}
+
 export async function runScenarios() {
   await scenarioConcurrentIdempotency();
   await scenarioConflict();
   await scenarioBreakBoundary();
   await scenarioTailMissing();
   await scenarioCrashAtomicity();
+  await scenarioCrashBoundaries();
   return results;
 }

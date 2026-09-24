@@ -253,6 +253,171 @@ test('崩溃于锚点推进后、意图清理前：记录完整，重试幂等',
   assert.equal(retry.reused, true);
 });
 
+// ---------- 提交边界崩溃矩阵 ----------
+
+// 一次提交全程的持久化边界（每次落盘写为一个边界，关闭可落在任意两者之间）：
+//   1. 操作索引 pending   2. 意图写入   3. 链追加
+//   4. 锚点推进           5. 操作索引 committed   6. 意图清理
+const SUBMIT_BOUNDARIES = [
+  { name: '操作索引 pending 落盘后', key: 'K_OPERATION_INDEX', count: 1, committed: false },
+  { name: '意图写入后', key: 'K_INTENTS', count: 1, committed: false },
+  { name: '链追加后（锚点未推进）', key: 'K_CHAIN', count: 1, committed: true },
+  { name: '锚点推进后（索引未补记）', key: 'K_ANCHOR', count: 1, committed: true },
+  { name: '操作索引 committed 后（意图未清）', key: 'K_OPERATION_INDEX', count: 2, committed: true },
+  { name: '意图清理后（全部落盘完成）', key: 'K_INTENTS', count: 2, committed: true },
+];
+
+// 在第 targetCount 次写 targetKey 落盘后立即模拟标签页关闭。
+function dieAtWrite(targetKey, targetCount) {
+  const counts = new Map();
+  return ({ key }) => {
+    const n = (counts.get(key) || 0) + 1;
+    counts.set(key, n);
+    return key === targetKey && n === targetCount ? 'die' : undefined;
+  };
+}
+
+async function crashAtBoundaryAndReopen({ boundary, seed = 2 }) {
+  const backend = { map: new Map(), tabs: new Set() };
+  const seedTab = makeTab(backend, 'seed', { timing: CRASH_TTL });
+  await seedTab.start();
+  for (let i = 0; i < seed; i += 1) {
+    await seedTab.submit(rec(`seed-${i}`, i));
+  }
+  seedTab.stop();
+  backend.map.delete(STORAGE_KEYS.K_LOCK);
+
+  const dying = makeTab(backend, 'dying', {
+    timing: CRASH_TTL,
+    onAfterWrite: dieAtWrite(STORAGE_KEYS[boundary.key], boundary.count),
+  });
+  await dying.start();
+  const crash = await dying.submit(rec('inflight', 77)).then(() => null, (err) => err);
+  assert.ok(crash instanceof LedgerError && crash.code === 'TAB_CLOSED', `预期模拟崩溃，实际: ${crash}`);
+
+  // 关闭瞬间的持久化真相：只允许“完整记录”或“完全无记录”两种终态
+  const chainAtCrash = JSON.parse(backend.map.get(STORAGE_KEYS.K_CHAIN) || '[]');
+  assert.equal(chainAtCrash.length, seed + (boundary.committed ? 1 : 0));
+  const recordAtCrash = boundary.committed ? chainAtCrash[seed] : null;
+  if (boundary.committed) {
+    assert.ok(recordAtCrash && recordAtCrash.opId === 'inflight');
+  }
+
+  // 重新打开（新实例 = 新标签页）：判定必须收敛到上述两种终态之一
+  const reopened = makeTab(backend, 'reopened', { timing: CRASH_TTL });
+  await reopened.start();
+  const state = reopened.readState();
+  assert.equal(state.status, 'ready');
+  assert.equal(state.chain.length, seed + (boundary.committed ? 1 : 0));
+  await assertChainHealthy(backend);
+  assert.equal(backend.map.get(STORAGE_KEYS.K_INTENTS), '[]');
+
+  // 完全相同的仪器、剂量、操作人、操作标识重试
+  const retry = await reopened.submit(rec('inflight', 77));
+  assert.equal(retry.block.seq, seed + 1);
+  assert.equal(retry.block.opId, 'inflight');
+  if (boundary.committed) {
+    // 记录已完整形成：必须返回原记录，链一字节不变
+    assert.equal(retry.reused, true, '记录已完整形成：重试必须幂等返回原记录');
+    assert.equal(retry.block.digest, recordAtCrash.digest);
+    assert.equal(backend.map.get(STORAGE_KEYS.K_CHAIN), JSON.stringify(chainAtCrash));
+  } else {
+    // 完全无记录：必须允许同一操作重新提交
+    assert.equal(retry.reused, false, '完全无记录：重试必须重新出块，不得被“等待裁决”卡住');
+  }
+  const finalState = reopened.readState();
+  assert.equal(finalState.chain.length, seed + 1);
+  assert.equal(finalState.head.digest, retry.block.digest);
+  await assertChainHealthy(backend);
+  // 可信链头锚点与真实链头一致
+  assert.deepEqual(JSON.parse(backend.map.get(STORAGE_KEYS.K_ANCHOR)), {
+    seq: seed + 1, digest: retry.block.digest,
+  });
+
+  // 异参复用稳定拒绝，可信链头不变
+  const headBytes = backend.map.get(STORAGE_KEYS.K_CHAIN);
+  const anchorBytes = backend.map.get(STORAGE_KEYS.K_ANCHOR);
+  for (let i = 0; i < 2; i += 1) {
+    await assert.rejects(() => reopened.submit(rec('inflight', 78)),
+      (err) => err.code === 'OPID_CONFLICT');
+  }
+  assert.equal(backend.map.get(STORAGE_KEYS.K_CHAIN), headBytes);
+  assert.equal(backend.map.get(STORAGE_KEYS.K_ANCHOR), anchorBytes);
+
+  // 其它操作仍可正常追加，序号连续
+  const other = await reopened.submit(rec('other-op', 5));
+  assert.equal(other.block.seq, seed + 2);
+  await assertChainHealthy(backend);
+  reopened.stop();
+}
+
+for (const boundary of SUBMIT_BOUNDARIES) {
+  test(`提交边界崩溃矩阵[${boundary.name}]：重开后只判定完整记录或完全无记录`, async () => {
+    await crashAtBoundaryAndReopen({ boundary, seed: 2 });
+  });
+}
+
+test('问题复现序列：记录未形成时关闭，先追加其它操作，再重试同一操作标识', async () => {
+  const backend = { map: new Map(), tabs: new Set() };
+  const seedTab = makeTab(backend, 'seed', { timing: CRASH_TTL });
+  await seedTab.start();
+  await seedTab.submit(rec('seed-0', 1));
+  seedTab.stop();
+  backend.map.delete(STORAGE_KEYS.K_LOCK);
+
+  // 剂量确认提交尚未得到页面结果就关闭标签页：崩溃于操作索引 pending 落盘后
+  const dying = makeTab(backend, 'dying', {
+    timing: CRASH_TTL,
+    onAfterWrite: dieAtWrite(STORAGE_KEYS.K_OPERATION_INDEX, 1),
+  });
+  await dying.start();
+  const crash = await dying.submit(rec('dose-confirm', 77)).then(() => null, (err) => err);
+  assert.ok(crash instanceof LedgerError && crash.code === 'TAB_CLOSED');
+
+  // 重新打开：台账仍可正常追加其它操作
+  const reopened = makeTab(backend, 'reopened', { timing: CRASH_TTL });
+  await reopened.start();
+  const other = await reopened.submit(rec('other-op', 5));
+  assert.equal(other.block.seq, 2);
+
+  // 用完全相同的仪器、整数剂量、操作人和操作标识重试：
+  // 必须允许完成，不得持续被拒绝为“正在等待裁决”
+  const retry = await reopened.submit(rec('dose-confirm', 77));
+  assert.equal(retry.reused, false);
+  assert.equal(retry.block.seq, 3);
+  // 再次同内容重试 -> 幂等返回原记录，链头不变
+  const headBytes = backend.map.get(STORAGE_KEYS.K_CHAIN);
+  const again = await reopened.submit(rec('dose-confirm', 77));
+  assert.equal(again.reused, true);
+  assert.equal(again.block.digest, retry.block.digest);
+  assert.equal(backend.map.get(STORAGE_KEYS.K_CHAIN), headBytes);
+  // 异参复用 -> 稳定拒绝
+  await assert.rejects(() => reopened.submit(rec('dose-confirm', 78)),
+    (err) => err.code === 'OPID_CONFLICT');
+  await assertChainHealthy(backend);
+  reopened.stop();
+});
+
+test('操作索引损坏：以链为事实源重建，同内容重试仍幂等返回原记录', async () => {
+  const backend = await seedChain(3);
+  backend.map.set(STORAGE_KEYS.K_OPERATION_INDEX, '{corrupted');
+  const tab = makeTab(backend, 'idx-repair', { timing: CRASH_TTL });
+  const state = await tab.start();
+  assert.equal(state.status, 'ready');
+  // 索引已按复算通过的链重建：同内容重试命中 committed，返回原记录
+  const again = await tab.submit(rec('seed-1', 2));
+  assert.equal(again.reused, true);
+  assert.equal(again.block.seq, 2);
+  // 异参复用仍稳定拒绝
+  await assert.rejects(() => tab.submit(rec('seed-1', 99)),
+    (err) => err.code === 'OPID_CONFLICT');
+  // 新操作可正常追加，序号连续
+  const next = await tab.submit(rec('fresh', 1));
+  assert.equal(next.block.seq, 4);
+  await assertChainHealthy(backend);
+  tab.stop();
+});
+
 // ---------- 断链检测与隔离 ----------
 
 async function seedChain(n = 3) {
